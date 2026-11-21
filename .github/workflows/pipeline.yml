@@ -98,7 +98,7 @@ jobs:
       - name: Check exit country
         run: |
           if [ -n "${RAKUTEN_PROXY:-}" ]; then P=(--proxy "$RAKUTEN_PROXY"); else P=(); fi
-          C="$(curl -fsS -m 20 "${P[@]}" https://ipinfo.io/country || curl -fsS -m 20 "${P[@]}" https://ifconfig.co/country-iso || true)"
+          C="$(curl -fsS -m 20 "${P[@]}" https://ifconfig.co/country-iso 2>/dev/null || curl -fsS -m 20 "${P[@]}" https://ipinfo.io/country 2>/dev/null || true)"
           C="$(echo "$C" | tr -d '[:space:]')"
           echo "Exit country: ${C:-unknown}"
           if [ -n "$C" ] && [ "$C" != "GB" ]; then
