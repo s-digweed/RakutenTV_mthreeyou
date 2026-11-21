@@ -133,9 +133,19 @@ class Api:
     def get_live_channels(cls) -> List[Dict]:
         channels: List[Dict] = []
         page = 1
+        per_page_options = [50, 30, 25, 20, 10]
+        per_page = per_page_options.pop(0)
         while True:
-            query = {**cls.base_query(), "page": page, "per_page": 100}
-            payload = cls._call("GET", "/live_channels", params=query)
+            query = {**cls.base_query(), "page": page, "per_page": per_page}
+            try:
+                payload = cls._call("GET", "/live_channels", params=query)
+            except RakutenError as e:
+                # Rakuten caps per_page (100 is rejected); step down and retry
+                if "invalid_per_page" in str(e) and per_page_options and page == 1:
+                    per_page = per_page_options.pop(0)
+                    log(f"per_page rejected, retrying with {per_page}")
+                    continue
+                raise
             data = payload.get("data", []) or []
             channels.extend(data)
             pagination = (payload.get("meta") or {}).get("pagination") or {}
