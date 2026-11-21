@@ -1,2 +1,3 @@
 python-dotenv
-requests
+requests[socks]
+urllib3>=1.26

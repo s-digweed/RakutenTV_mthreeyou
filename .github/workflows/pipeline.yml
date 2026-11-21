@@ -1,45 +1,139 @@
-name: GitHub Actions Demo
+name: Rakuten UK M3U
+
 on:
   schedule:
-    - cron: "0 */12 * * *"
+    - cron: "17 */12 * * *"
   workflow_dispatch:
     inputs:
       debug_enabled:
-        description: 'Run the build with tmate debugging enabled'
+        description: "Open a tmate SSH session for debugging"
+        type: boolean
         required: false
-        default: False
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rakuten-m3u
+  cancel-in-progress: true
+
 jobs:
   generate-m3u:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLASSIFICATION: uk
+
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
+          cache: pip
 
       - name: Install requirements
         run: pip install -r requirements.txt
 
-      - name: Create output directory
-        run: mkdir -p ./output
+      # RAKUTEN_UK can be any of:
+      #   - a proxy URL:          http://user:pass@host:port  (or socks5://..., or host:port)
+      #   - a WireGuard config:   the whole .conf, starting with [Interface]
+      #   - an OpenVPN config:    the whole .ovpn (optional RAKUTEN_UK_USERNAME / RAKUTEN_UK_PASSWORD secrets)
+      - name: Connect to UK VPN / proxy
+        env:
+          RAKUTEN_UK: ${{ secrets.RAKUTEN_UK }}
+          OVPN_USER: ${{ secrets.RAKUTEN_UK_USERNAME }}
+          OVPN_PASS: ${{ secrets.RAKUTEN_UK_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RAKUTEN_UK:-}" ]; then
+            echo "::error::Secret RAKUTEN_UK is missing or empty"; exit 1
+          fi
+
+          if grep -q '^\[Interface\]' <<<"$RAKUTEN_UK"; then
+            echo "Detected WireGuard config"
+            sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools >/dev/null
+            # DNS= needs resolvconf on the runner; not needed for geo-unlocking
+            printf '%s\n' "$RAKUTEN_UK" | sed '/^[[:space:]]*DNS[[:space:]]*=/d' | sudo tee /etc/wireguard/wg0.conf >/dev/null
+            sudo chmod 600 /etc/wireguard/wg0.conf
+            sudo wg-quick up wg0
+            echo "VPN_MODE=wireguard" >> "$GITHUB_ENV"
+
+          elif grep -qE '^(client|remote )' <<<"$RAKUTEN_UK"; then
+            echo "Detected OpenVPN config"
+            sudo apt-get update -qq && sudo apt-get install -y -qq openvpn >/dev/null
+            printf '%s\n' "$RAKUTEN_UK" > /tmp/vpn.ovpn
+            EXTRA=()
+            if [ -n "${OVPN_USER:-}" ]; then
+              printf '%s\n%s\n' "$OVPN_USER" "$OVPN_PASS" > /tmp/vpn.auth
+              chmod 600 /tmp/vpn.auth
+              EXTRA=(--auth-user-pass /tmp/vpn.auth)
+            fi
+            sudo openvpn --config /tmp/vpn.ovpn "${EXTRA[@]}" --daemon --log /tmp/openvpn.log --writepid /tmp/openvpn.pid
+            for i in $(seq 1 45); do
+              if sudo grep -q "Initialization Sequence Completed" /tmp/openvpn.log; then break; fi
+              sleep 2
+            done
+            if ! sudo grep -q "Initialization Sequence Completed" /tmp/openvpn.log; then
+              sudo tail -n 40 /tmp/openvpn.log; echo "::error::OpenVPN did not connect"; exit 1
+            fi
+            echo "VPN_MODE=openvpn" >> "$GITHUB_ENV"
+
+          else
+            echo "Treating RAKUTEN_UK as a proxy URL"
+            PROXY="$(printf '%s' "$RAKUTEN_UK" | tr -d '[:space:]')"
+            case "$PROXY" in
+              *://*) ;;
+              *) PROXY="http://$PROXY" ;;
+            esac
+            echo "::add-mask::$PROXY"
+            # only the python script uses this; git push stays direct
+            echo "RAKUTEN_PROXY=$PROXY" >> "$GITHUB_ENV"
+            echo "VPN_MODE=proxy" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check exit country
+        run: |
+          if [ -n "${RAKUTEN_PROXY:-}" ]; then P=(--proxy "$RAKUTEN_PROXY"); else P=(); fi
+          C="$(curl -fsS -m 20 "${P[@]}" https://ipinfo.io/country || curl -fsS -m 20 "${P[@]}" https://ifconfig.co/country-iso || true)"
+          C="$(echo "$C" | tr -d '[:space:]')"
+          echo "Exit country: ${C:-unknown}"
+          if [ -n "$C" ] && [ "$C" != "GB" ]; then
+            echo "::error::VPN/proxy exits in '$C', not GB - Rakuten UK will be geo-blocked"; exit 1
+          fi
 
       - name: Setup tmate session
         uses: mxschmitt/action-tmate@v3
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+        with:
+          limit-access-to-actor: true
 
       - name: Generate m3u list
-        run: python main.py > ./output/rakuten.m3u
-        env:
-          HTTP_PROXY: http://${{ secrets.PROXY_USERNAME }}:${{ secrets.PROXY_PASSWORD }}@${{ secrets.PROXY_IP }}:5009
-          HTTPS_PROXY: http://${{ secrets.PROXY_USERNAME }}:${{ secrets.PROXY_PASSWORD }}@${{ secrets.PROXY_IP }}:5009
+        run: |
+          mkdir -p output
+          python main.py > /tmp/rakuten.m3u
+          mv /tmp/rakuten.m3u output/rakuten.m3u
+          head -n 5 output/rakuten.m3u
 
-      - name: Add updated list to repository
-        uses: EndBug/add-and-commit@v9
-        with:
-          default_author: github_actions
-          message: Add/update list
-          add: '*.m3u --force'
-          cwd: './output/'
+      - name: Disconnect VPN
+        if: always()
+        run: |
+          case "${VPN_MODE:-}" in
+            wireguard) sudo wg-quick down wg0 || true ;;
+            openvpn)   sudo kill "$(cat /tmp/openvpn.pid)" 2>/dev/null || true ;;
+          esac
+
+      - name: Commit updated list
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f output/rakuten.m3u
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Update Rakuten UK list"
+            git push
+          fi
