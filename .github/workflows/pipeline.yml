@@ -135,5 +135,7 @@ jobs:
             echo "No changes"
           else
             git commit -m "Update Rakuten UK list"
-            git push
+            # newer run wins: rebase onto anything that landed meanwhile; on a conflict, abort and still publish
+            git pull --rebase origin master || git rebase --abort
+            git push --force-with-lease
           fi
